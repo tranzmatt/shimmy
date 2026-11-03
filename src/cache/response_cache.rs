@@ -150,6 +150,10 @@ impl ResponseCache {
         }
     }
 
+    fn occupied_bytes(cache: &HashMap<CacheKey, CachedResponse>) -> usize {
+        cache.values().map(|entry| entry.size_bytes).sum()
+    }
+
     /// Get cached response if available and not expired
     pub async fn get(&self, key: &CacheKey) -> Option<String> {
         if !self.config.enabled {
@@ -163,6 +167,8 @@ impl ResponseCache {
             if entry.is_expired(self.config.default_ttl) {
                 // Remove expired entry
                 cache.remove(key);
+                stats.entries = cache.len();
+                stats.total_size_bytes = Self::occupied_bytes(&cache);
                 stats.misses += 1;
                 debug!("Cache miss: expired entry");
                 None
@@ -192,44 +198,44 @@ impl ResponseCache {
         }
 
         let entry = CachedResponse::new(response, response_time);
-        let entry_size = entry.size_bytes;
+        let max_size_bytes = self.config.max_size_mb.saturating_mul(1024 * 1024);
+        if self.config.max_entries == 0 || entry.size_bytes > max_size_bytes {
+            return;
+        }
 
         let mut cache = self.cache.write().await;
         let mut stats = self.stats.write().await;
 
-        // Replacing an entry must release its previous contribution to the
-        // size accounting before capacity checks and insertion.
-        if let Some(previous) = cache.remove(&key) {
-            stats.total_size_bytes -= previous.size_bytes;
-        }
-
-        // Check if we need to evict entries
-        while cache.len() >= self.config.max_entries
-            || stats.total_size_bytes + entry_size > self.config.max_size_mb * 1024 * 1024
-        {
-            if let Some(lru_key) = self.find_lru_key(&cache).await {
+        // Let the map decide whether this is a replacement, then derive occupancy
+        // from its actual entries instead of maintaining a separate running sum.
+        cache.insert(key.clone(), entry);
+        let mut occupied = Self::occupied_bytes(&cache);
+        while cache.len() > self.config.max_entries || occupied > max_size_bytes {
+            if let Some(lru_key) = Self::find_lru_key(&cache, &key) {
                 if let Some(removed) = cache.remove(&lru_key) {
-                    stats.total_size_bytes -= removed.size_bytes;
+                    occupied -= removed.size_bytes;
                     stats.evictions += 1;
                     debug!("Evicted LRU cache entry");
                 }
             } else {
-                break; // No entries to evict
+                break;
             }
         }
 
-        // Insert new entry
-        cache.insert(key.clone(), entry);
         stats.entries = cache.len();
-        stats.total_size_bytes += entry_size;
+        stats.total_size_bytes = occupied;
 
         info!("Cached response for key: {:?}", key);
     }
 
     /// Find least recently used key for eviction
-    async fn find_lru_key(&self, cache: &HashMap<CacheKey, CachedResponse>) -> Option<CacheKey> {
+    fn find_lru_key(
+        cache: &HashMap<CacheKey, CachedResponse>,
+        inserted_key: &CacheKey,
+    ) -> Option<CacheKey> {
         cache
             .iter()
+            .filter(|(key, _)| *key != inserted_key)
             .min_by_key(|(_, entry)| entry.last_accessed)
             .map(|(key, _)| key.clone())
     }
@@ -244,12 +250,12 @@ impl ResponseCache {
         let mut stats = self.stats.write().await;
 
         let initial_count = cache.len();
-        let initial_size = stats.total_size_bytes;
+        let initial_size = Self::occupied_bytes(&cache);
 
         cache.retain(|_, entry| !entry.is_expired(self.config.default_ttl));
 
         // Recalculate size
-        stats.total_size_bytes = cache.values().map(|e| e.size_bytes).sum();
+        stats.total_size_bytes = Self::occupied_bytes(&cache);
         stats.entries = cache.len();
 
         let removed_count = initial_count - cache.len();
@@ -268,11 +274,9 @@ impl ResponseCache {
         let mut cache = self.cache.write().await;
         let mut stats = self.stats.write().await;
 
-        let cleared_entries = cache.len() as u64;
-        cache.clear();
+        stats.evictions += cache.drain().count() as u64;
         stats.entries = 0;
         stats.total_size_bytes = 0;
-        stats.evictions += cleared_entries;
 
         info!("Cache cleared");
     }
@@ -283,7 +287,7 @@ impl ResponseCache {
         let stats_guard = self.stats.read().await;
         let mut stats = (*stats_guard).clone();
         stats.entries = cache.len();
-        stats.total_size_bytes = cache.values().map(|e| e.size_bytes).sum();
+        stats.total_size_bytes = Self::occupied_bytes(&cache);
         stats
     }
 
@@ -409,52 +413,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_overwrite_updates_size_accounting() {
+    async fn replacing_a_key_keeps_the_remaining_capacity_available() {
         let cache = ResponseCache::with_config(ResponseCacheConfig {
-            max_entries: 1,
+            max_entries: 2,
+            max_size_mb: 1,
+            max_prompt_length: 1_048_576,
             ..Default::default()
         });
-        let key = create_test_key("overwrite", "model");
-        let replacement = "a longer replacement response".to_string();
+        let first = create_test_key("first", "model");
+        let second = create_test_key("second", "model");
 
         cache
-            .put(
-                key.clone(),
-                "short response".to_string(),
-                Duration::from_millis(10),
-            )
+            .put(first.clone(), "x".repeat(700_000), Duration::ZERO)
             .await;
         cache
-            .put(key, replacement.clone(), Duration::from_millis(10))
+            .put(first.clone(), "new".to_string(), Duration::ZERO)
+            .await;
+        cache
+            .put(second.clone(), "y".repeat(700_000), Duration::ZERO)
             .await;
 
-        let stats = cache.stats.read().await;
-        assert_eq!(stats.entries, 1);
+        assert_eq!(cache.get(&first).await.as_deref(), Some("new"));
+        assert!(cache.get(&second).await.is_some());
+        let stats = cache.stats().await;
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.total_size_bytes, 700_003);
         assert_eq!(stats.evictions, 0);
-        assert_eq!(stats.total_size_bytes, replacement.len());
     }
 
     #[tokio::test]
-    async fn test_cache_clear_counts_evictions() {
-        let cache = ResponseCache::new();
+    async fn oversized_response_does_not_displace_a_valid_entry() {
+        let cache = ResponseCache::with_config(ResponseCacheConfig {
+            max_size_mb: 1,
+            max_prompt_length: 2 * 1024 * 1024,
+            ..Default::default()
+        });
+        let valid = create_test_key("valid", "model");
+        let oversized = create_test_key("oversized", "model");
 
         cache
-            .put(
-                create_test_key("clear 1", "model"),
-                "response 1".to_string(),
-                Duration::from_millis(10),
-            )
+            .put(valid.clone(), "kept".to_string(), Duration::ZERO)
             .await;
         cache
             .put(
-                create_test_key("clear 2", "model"),
-                "response 2".to_string(),
-                Duration::from_millis(10),
+                oversized.clone(),
+                "z".repeat(1024 * 1024 + 1),
+                Duration::ZERO,
             )
             .await;
+
+        assert_eq!(cache.get(&valid).await.as_deref(), Some("kept"));
+        assert!(cache.get(&oversized).await.is_none());
+        assert_eq!(cache.stats().await.evictions, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_counts_the_entries_it_removes() {
+        let cache = ResponseCache::new();
+        for prompt in ["one", "two"] {
+            cache
+                .put(
+                    create_test_key(prompt, "model"),
+                    prompt.to_string(),
+                    Duration::ZERO,
+                )
+                .await;
+        }
 
         cache.clear().await;
-
         let stats = cache.stats().await;
         assert_eq!(stats.entries, 0);
         assert_eq!(stats.total_size_bytes, 0);

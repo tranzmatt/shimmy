@@ -16,6 +16,10 @@ minor-version increment.
 
 ### Fixed
 
+- Derive response-cache occupancy from stored entries so replacement and expiry
+  cannot leave stale byte counts; count cleared entries as evictions.
+- Reject responses larger than the configured cache capacity without evicting
+  valid entries.
 - Return exact prompt/completion token counts and truthful `stop`/`length`
   reasons in OpenAI/native JSON responses and OpenAI streaming responses.
 - Support `stream_options.include_usage`; report streaming generation failures
